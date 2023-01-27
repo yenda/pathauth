@@ -4,6 +4,8 @@
             [edn-query-language.core :as eql]
             [clojure.set :as set]))
 
+(def auth ::auth)
+
 (defn circular-dependency? [resolver]
   (-> resolver :config ::circular?))
 
