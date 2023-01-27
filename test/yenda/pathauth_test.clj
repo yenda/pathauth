@@ -1,6 +1,6 @@
 (ns yenda.pathauth-test
   (:require [clojure.test :refer :all]
-            [yenda.pathauth :refer :all :as pathauth]
+            [yenda.pathauth :refer :all :as pa]
             [com.wsscode.pathom3.format.shape-descriptor :as pfsd]
             [com.wsscode.pathom3.connect.operation :as pco]
             [com.wsscode.pathom3.connect.indexes :as pci]
@@ -25,7 +25,7 @@
   [env input]
   {::pco/input  [:child/id]
    ::pco/batch? true
-   ::pathauth/auth [:child/parent?]
+   ::pa/auth [:child/parent?]
    ::pco/output [{:child/toys [:toy/id]}]}
 
   [{:child/toys [{:toy/id 1}
@@ -46,8 +46,8 @@
   [env inputs]
   {::pco/input  [:child/id]
    ::pco/batch? true
-   ::pathauth/auth [:child/parent?]
-   ::pathauth/circular? true
+   ::pa/auth [:child/parent?]
+   ::pa/circular? true
    ::pco/output [:parent/id]}
   (let [parents {1  4
                  2  5
@@ -68,7 +68,7 @@
 
 
 (def env (-> (pci/register
-              (pathauth/setup
+              (pa/auth-setup
                [toy
                 child-toys
                 favorite-toy
@@ -84,10 +84,9 @@
   ;; => {[:child/id 1] #:child{:toys [#:toy{:name "Bobby"} #:toy{:name "Alice"} #:toy{:name "Rene"}]}}
 
   ;; unauthorized, will fail
-  (let [query [{[:child/id 1] [{:child/toys [:toy/name]}]}]]
-    @(p.a.eql/process (assoc env
-                             ::p.a.eql/parallel? true
-                             ) query))
+  (let [query ]
+    @(p.a.eql/process (assoc env ::p.a.eql/parallel? true)
+                      [{[:child/id 1] [{:child/toys [:toy/name]}]}]query))
 
 
   )

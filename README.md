@@ -2,61 +2,146 @@
 
   Pathauth is designed to set up fine grained authorizations of resolvers as an orthogonal
   concern without compromising on performances and complexity.
+  
+  As a developer, all you have to do is write the authorization resolvers that will resolve authorization attributes and to use these authorization attributes in the `::pa/auth` key of other resolvers' config.
+  
+  The idea is to leverage the pathom planner to figure out on its own how to find the attributes needed to establish if the access to a particular attribute is authorized or not.
+  
+ As a result an authorization can depend on any accessible attribute, or even on another authorization. If a path exists to solve the authorization, even a recursive one, Pathom will find it. And there is little to worry about performance, as batching and caching will perform with a minimal number of calls (eg to the database).
+
+## Alpha warning
+
+It is recommended to use the latest commit on Pathom3 repository as well as the async parallel parser until https://github.com/wilkerlucio/pathom3/issues/177 is fixed.
+
+```clojure
+@(p.a.eql/process (assoc env ::p.a.eql/parallel? true) 
+                  query)
+```
+
+The development of Pathauth is still really early stage:
+- no automated tests
+- expected API breakage
+- potential bugs
+
+For these reasons the current way to use it is via deps.edn git/url:
+```clojure
+yenda/pathauth {:git/url "https://github.com/yenda/pathauth.git"
+                :sha "latestsha"}
+```
 
 ## Getting started
 
 To set up fine grained authorization of your resolver, all you need to do is:
-- write authorization resolvers (see below)
-- make sure all your resolvers are passed to wrap-resolvers before adding them to pathom env
-- add authorizations to your resolvers' config (see below)
+- [write at least one authorization resolver](#authorization-resolver)
+- [add authorizations to your resolvers' config](#simple-resolver-with-authorization)
+- if your queries are coming from an untrusted source, use `pa/safe-query` to ensure no `pending-authorization`s are present in the query (which would otherwise bypass the pending authorization resolvers)
+- make sure all your resolvers are passed to `auth-setup` before registering them, for example:
 
-## Usage
-
-To add authorization to a resolver you simply add ::pathauth/authorizations to their config.
+```clojure
+(def env (-> (pci/register
+              (pa/auth-setup
+               [toy
+                child-toys
+                favorite-toy
+                child-parents
+                parent?]))))
+```
+ 
 
 ### Authorization resolver
 
 A classic Pathom resolver whose outputs are authorization attributes that are only returned if the conditions are met.
 Inputs can be any arbitrary attribute that is needed to determine that the authorizations are granted.
+Outputs are the attributes that will be used in the `::pa/auth` config of other resolver.
 
-Those do not have a ::pathauth/authorizations config, their outputs are the attributes you
-will use in the ::pathauth/authorizations config of other resolver.
+```clojure
+(pco/defresolver parent?
+  [{:keys [parent-id] :as env} inputs]
+  {::pco/input  [:child/id :parent/id]
+   ::pco/batch? true
+   ::pco/output [:child/parent?]}
+  (mapv (fn [input]
+          (when (= parent-id (:parent/id input))
+            {:child/parent? true}))
+        inputs))
+```
+
 
 - inputs: inputs-required-for-authorization
 - output: authorizations
 
 ### Simple resolver with authorization
 
-A resolver that will only be accessed if the attributes passed in ::pa/authorizations are resolving.
-The resolver cannot provide an attribute as output that is an input of an authorization resolver.
-To achieve this Pathauth will concatenate the authorizations to the inputs of the resolver.
-Pathom will do the work for you and figure out the optimal resolutions. If the access to the attributes
-is not authorized Pathom will simply not resolve them.
+To add authorization to a resolver you simply add `::pa/auth` to their config with the desired authorization attributes.
 
-- inputs: (concat resolver-authorizations resolver-inputs)
-- outputs: resolver-outputs
+The resolver will now require the attributes passed in `::pa/auth` as inputs. If the conditions are not met for the authorization attributes to be resolved, Pathom won't be able to use that path to resolve the query.
+
+The resolver cannot provide an attribute as output that is an input of an authorization resolver.
 
 ### Special resolver with circular dependency between authorization and outputs
 
 To resolve the case of a circular dependency between a resolver that requires an
 authorization and that authorization requiring at least one of the outputs of the resolver
-as input.
-Pathauth will ignore the authorization and nest the outputs within an :pending.{authorization} key.
+as input, add `::pa/circular? true` to the resolver config to signal a circular dependency between the resolver and the authorization resolver (NOTE: a future version of the library should be able to figure that out on its own).
 
-This alleviates the need to handle these circular dependency on your own. Eg in the
-case where you have a resolver by id for an entity with one of the output attributes being
-used to determine the authorization.
+This will nest the output of the resolver, and generate a pending authorization resolver.
 
-- inputs resolver-inputs
-- outputs [{:pending.{authorization} resolver-outputs}]
+#### Example
 
-### Extra generated resolver
+```clojure
+(pco/defresolver child-parents
+  [env inputs]
+  {::pco/input  [:child/id]
+   ::pco/batch? true
+   ::pa/auth [:child/parent?]
+   ::pa/circular? true
+   ::pco/output [:parent/id]}
+  (let [parents {1  4
+                 2  5
+                 3  6}]
+    (mapv (fn [input]
+            {:parent/id (get parents (:child/id input))})
+          inputs)))
+ 
+;; actual output of the resolver will be
 
-These resolvers are generated by Pathauth for the special resolvers and will simply un-nest the output of a resolver
-if the required authorizations are resolved.
+[{:pending-authorization/yenda.pathauth-test--child-parents [:parent/id :child/id]}]
+```
 
-- inputs [{:pending.{authorization} resolver-outputs}]
-- outputs resolver-outputs
+
+### Pending authentication resolver
+
+These resolvers are generated by Pathauth for the special resolvers and will simply un-nest the output of a resolver if the required authorizations are resolved.
+
+The previous example will generate the following pending authentication resolver:
+
+```clojure
+{:input
+ [{#:pending-authorization/yenda.pathauth-test--child-parents [:child/parent? :parent/id :child/id]}],
+ :op-name pending-authorization/yenda.pathauth-test--child-parents,
+ :output [:parent/id]}
+```
+
+Looking at the two previous example we can see how things work under the hood. Lets take the following query example:
+
+```clojure
+    @(p.a.eql/process (assoc env ::p.a.eql/parallel? true :parent-id 4)
+                      [{[:child/id 1] [:parent/id]}])
+```
+- the child-parents resolver will be called, in order to obtain both the `:parent/id` and `:child/id` attributes that are required by the authorization resolver for `:child/parent?`
+- to find the `:parent/id` of the parent of a child, we need `:child/parent?`, but `:child/parent?` is resolved by checking that the `:parent/id` matches the `:parent-id` in the env
+- the query isn't resolved directly by the `child-parents` resolver, as its regular outputs are now nested in a `pending-authorization...`, but this now means `:parent/id` and `:child/id` are now available as input for the authorization resolver
+
+```clojure
+;; child-parents will output:
+[{:pending-authorization/yenda.pathauth-test--child-parents {:parent/id 4 :child/id 1}}]
+;; the authorization resolver is then able to resolve the authorization attribute
+[{:pending-authorization/yenda.pathauth-test--child-parents {:parent/id 4 :child/id 1 :child/parent? true}}]
+```
+- the `pending-authorization-resolver` can now resolve the query
+```clojure
+[{[:child/id 1] {:parent/id 4}}]
+```
 
 ## Library development
 

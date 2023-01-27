@@ -63,11 +63,12 @@
             (wrap-authorization operation-or-operations)))
         operation-or-operations))
 
-(defn safe-query [query]
-  (let [ast (eql/query->ast query)
-        ;; remove the unauthorized keys from the query
-        ast (eql/transduce-children (map (fn [k]
-                                           (when (= "pending-authorization" (namespace (:dispatch-key k)))
-                                             (throw (Exception. "Illegal query")))
-                                           k))
-                                    ast)]))
+(defn safe-query
+  "remove the pending-authorization keys from the query"
+  [query]
+  (let [ast (eql/query->ast query)]
+    (eql/transduce-children (map (fn [k]
+                                   (when (= "pending-authorization" (namespace (:dispatch-key k)))
+                                     (throw (Exception. "Illegal query")))
+                                   k))
+                            ast)))
