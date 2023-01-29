@@ -2,7 +2,8 @@
   (:require [com.wsscode.pathom3.connect.operation :as pco]
             [com.wsscode.pathom3.format.shape-descriptor :as pfsd]
             [edn-query-language.core :as eql]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [taoensso.timbre :as log]))
 
 (def auth ::auth)
 
@@ -22,7 +23,7 @@
 
       ;; special resolver
       (let [{:keys [resolve config]} resolver
-            {::pco/keys [input output op-name]} config
+            {::pco/keys [input output op-name batch?]} config
             pending-resolver-op-name (symbol
                                       "pending-authorization"
                                       (str (namespace op-name) "--" (name op-name)))
@@ -33,18 +34,25 @@
            ;; pending resolver
            ::pco/output [{pending-key (vec (into #{} (concat input output)))}]
            ::pco/input input
-           ::pco/batch? true
+           ::pco/batch? batch?
            ::pco/resolve (fn [env inputs]
-                           (mapv (fn [result input]
-                                   {pending-key (merge input result)})
-                                 (resolve env inputs)
-                                 inputs))})
+                           (log/info :batch? op-name batch?)
+                           (time (if batch?
+                                   (mapv (fn [result input]
+                                           {pending-key (merge input result)})
+                                         (resolve env inputs)
+                                         inputs)
+                                   {pending-key (merge inputs (resolve env inputs))})))})
          (pco/resolver
           {::pco/op-name pending-resolver-op-name
            ::pco/output  output
-           ::pco/batch?  true
-           ::pco/resolve (fn [env inputs]
-                           (mapv pending-key inputs))
+           #_#_           ::pco/batch?  true
+           ::pco/resolve
+           (fn [env inputs]
+             (get inputs pending-key))
+           #_(fn [env inputs]
+               (log/info :batch? pending-resolver-op-name)
+               (mapv (fn [input] ) inputs))
            ::pco/input [{pending-key (vec (into #{} (concat input output authorizations)))}]})]))
 
     ;; resolver without authorization or authorization resolver
