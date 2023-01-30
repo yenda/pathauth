@@ -7,71 +7,19 @@
 
 (def auth ::auth)
 
-(defn circular-dependency? [resolver]
-  (-> resolver :config ::circular?))
+(defn auth-attributes [attributes schema]
+  (let [k->attr (taoensso.encore/keys-by :com.fulcrologic.rad.attributes/qualified-key attributes)]
+    (->> attributes
+         (filter #(= schema (:com.fulcrologic.rad.attributes/schema %)))
+         (reduce
+          (fn [acc attribute]
+            (assoc acc (:com.fulcrologic.rad.attributes/qualified-key attribute)
+                   (if (:com.fulcrologic.rad.attributes/identity? attribute)
+                     (::auth attribute)
+                     (vec (mapcat (fn [entity-id]
+                                    (::auth (k->attr entity-id)))
+                                  (:com.fulcrologic.rad.attributes/identities attribute))))))))))
 
-(defn wrap-authorization [resolver]
-  (if-let [authorizations (-> resolver :config ::auth)]
-    (if-not (circular-dependency? resolver)
-      ;; simple resolver
-      (let [input (get-in resolver [:config ::pco/input])
-            new-input (-> input (concat authorizations) vec)
-            new-requires (pco/describe-input new-input)]
-        (-> resolver
-            (assoc-in [:config ::pco/input] new-input)
-            (update :config merge  new-requires)))
-
-      ;; special resolver
-      (let [{:keys [resolve config]} resolver
-            {::pco/keys [input output op-name batch?]} config
-            pending-resolver-op-name (symbol
-                                      "pending-authorization"
-                                      (str (namespace op-name) "--" (name op-name)))
-            pending-key (keyword pending-resolver-op-name)]
-        [(pco/resolver
-          {::pco/op-name op-name
-           ;; TODO: optimize to only ouput the inputs that are required by the
-           ;; pending resolver
-           ::pco/output [{pending-key (vec (into #{} (concat input output)))}]
-           ::pco/input input
-           ::pco/batch? batch?
-           ::pco/resolve (fn [env inputs]
-                           (log/info :batch? op-name batch?)
-                           (time (if batch?
-                                   (mapv (fn [result input]
-                                           {pending-key (merge input result)})
-                                         (resolve env inputs)
-                                         inputs)
-                                   {pending-key (merge inputs (resolve env inputs))})))})
-         (pco/resolver
-          {::pco/op-name pending-resolver-op-name
-           ::pco/output  output
-           #_#_           ::pco/batch?  true
-           ::pco/resolve
-           (fn [env inputs]
-             (get inputs pending-key))
-           #_(fn [env inputs]
-               (log/info :batch? pending-resolver-op-name)
-               (mapv (fn [input] ) inputs))
-           ::pco/input [{pending-key (vec (into #{} (concat input output authorizations)))}]})]))
-
-    ;; resolver without authorization or authorization resolver
-    resolver))
-
-(defn auth-setup [operation-or-operations]
-  ;; TODO: automatically detect circular dependencies between authorization resolvers
-  ;; and resolvers
-  #_(let [auth-attributes (reduce (fn [acc {:keys [config]}]
-                                    (if-let [authorizations (::auth config)]
-                                      (set/union acc (into #{} authorizations))
-                                      acc))
-                                  #{}
-                                  resolvers)])
-  (mapv (fn [operation-or-operations]
-          (if (sequential? operation-or-operations)
-            (auth-setup operation-or-operations)
-            (wrap-authorization operation-or-operations)))
-        operation-or-operations))
 
 (defn safe-query
   "remove the pending-authorization keys from the query"
@@ -82,3 +30,20 @@
                                      (throw (Exception. "Illegal query")))
                                    k))
                             ast)))
+
+
+(defn auth-query
+  "remove the pending-authorization keys from the query"
+  [auth-attributes query]
+  (let [ast (eql/query->ast query)
+        authed-query (-> (eql/transduce-children (map (fn [k]
+                                                        (if-let [authorizations (some #(get auth-attributes (:dispatch-key %)) (:children k))]
+                                                          (reduce (fn [acc authorization]
+                                                                    (update acc :children conj {:type :prop :dispatch-key authorization :key authorization}))
+                                                                  k
+                                                                  authorizations)
+                                                          k)))
+                                                 ast)
+                         eql/ast->query)]
+    (log/info :authed-query (pr-str authed-query))
+    (eql/query->ast authed-query)))

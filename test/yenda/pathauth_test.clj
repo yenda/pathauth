@@ -78,15 +78,14 @@
 (comment
   ;; authorized, will return
   (let [query [{[:child/id 1] [{:child/toys [:toy/name]}]}]]
-    @(p.a.eql/process (assoc env
-                             ::p.a.eql/parallel? true
-                             :parent-id 4) query))
+    (p.eql/process (assoc env :parent-id 4) query))
   ;; => {[:child/id 1] #:child{:toys [#:toy{:name "Bobby"} #:toy{:name "Alice"} #:toy{:name "Rene"}]}}
 
   ;; unauthorized, will fail
   (let [query ]
-    @(p.a.eql/process (assoc env ::p.a.eql/parallel? true)
-                      [{[:child/id 1] [{:child/toys [:toy/name]}]}]query))
+    (p.eql/process env
+                   [{[:child/id 1] [{:child/toys [:toy/name]}]}]
+                   ))
 
 
   )
