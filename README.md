@@ -11,13 +11,35 @@
 
 ## Alpha warning
 
-It is recommended to use the latest commit on Pathom3 repository as well as the async parallel parser until https://github.com/wilkerlucio/pathom3/issues/177 is fixed.
-
+Current status:
+- used with `fulcro-rad`, `::pa/auth` is added to attributes that require authorization.
+- parser must be used in lenient mode
+- queries are authorized with `(pa/auth-query authorization-attributes query)`
 ```clojure
-@(p.a.eql/process (assoc env ::p.a.eql/parallel? true) 
-                  query)
+(def auth-attributes (pa/auth-attributes all-attributes :production))
+(def my-query (pa/auth-query auth-attributes tx))
 ```
 
+- middleware needs to throw on resolver error and response needs to be cleaned up when ex-data `:unauthorized` is true
+
+```clojure
+(p.plugin/register
+       {::p.plugin/id 'err
+        :com.wsscode.pathom3.connect.runner/wrap-resolver-error
+        (fn [_]
+          (fn [env node error]
+            (if (= "Unauthorized" (ex-message error))
+              (throw (ex-info "Unauthorized" {:unauthorized true}))
+              (do
+                (log/error (ex-message error) error)
+                (ex-message error)))))})
+```
+
+```clojure
+(if (-> response :com.wsscode.pathom3.error/error-data :unauthorized)
+          "Unauthorized"
+          response)
+```
 The development of Pathauth is still really early stage:
 - no automated tests
 - expected API breakage
@@ -34,25 +56,16 @@ yenda/pathauth {:git/url "https://github.com/yenda/pathauth.git"
 To set up fine grained authorization of your resolver, all you need to do is:
 - [write at least one authorization resolver](#authorization-resolver)
 - [add authorizations to your resolvers' config](#simple-resolver-with-authorization)
-- if your queries are coming from an untrusted source, use `pa/safe-query` to ensure no `pending-authorization`s are present in the query (which would otherwise bypass the pending authorization resolvers)
-- make sure all your resolvers are passed to `auth-setup` before registering them, for example:
 
-```clojure
-(def env (-> (pci/register
-              (pa/auth-setup
-               [toy
-                child-toys
-                favorite-toy
-                child-parents
-                parent?]))))
-```
- 
 
 ### Authorization resolver
 
-A classic Pathom resolver whose outputs are authorization attributes that are only returned if the conditions are met.
+A classic Pathom resolver whose outputs are authorization attributes.
+
 Inputs can be any arbitrary attribute that is needed to determine that the authorizations are granted.
-Outputs are the attributes that will be used in the `::pa/auth` config of other resolver.
+Outputs are the authorization attributes that will be used in the `::pa/auth` config of other resolver.
+
+They return nothing or throw unauthorized if the authorization is not granted.
 
 ```clojure
 (pco/defresolver parent?
@@ -61,87 +74,14 @@ Outputs are the attributes that will be used in the `::pa/auth` config of other 
    ::pco/batch? true
    ::pco/output [:child/parent?]}
   (mapv (fn [input]
-          (when (= parent-id (:parent/id input))
-            {:child/parent? true}))
-        inputs))
+          (when-not (= parent-id (:parent/id input))
+            (throw (ex-date "Unauthorized" {}))))))
 ```
 
-
-- inputs: inputs-required-for-authorization
-- output: authorizations
 
 ### Simple resolver with authorization
 
 To add authorization to a resolver you simply add `::pa/auth` to their config with the desired authorization attributes.
-
-The resolver will now require the attributes passed in `::pa/auth` as inputs. If the conditions are not met for the authorization attributes to be resolved, Pathom won't be able to use that path to resolve the query.
-
-The resolver cannot provide an attribute as output that is an input of an authorization resolver.
-
-### Special resolver with circular dependency between authorization and outputs
-
-To resolve the case of a circular dependency between a resolver that requires an
-authorization and that authorization requiring at least one of the outputs of the resolver
-as input, add `::pa/circular? true` to the resolver config to signal a circular dependency between the resolver and the authorization resolver (NOTE: a future version of the library should be able to figure that out on its own).
-
-This will nest the output of the resolver, and generate a pending authorization resolver.
-
-#### Example
-
-```clojure
-(pco/defresolver child-parents
-  [env inputs]
-  {::pco/input  [:child/id]
-   ::pco/batch? true
-   ::pa/auth [:child/parent?]
-   ::pa/circular? true
-   ::pco/output [:parent/id]}
-  (let [parents {1  4
-                 2  5
-                 3  6}]
-    (mapv (fn [input]
-            {:parent/id (get parents (:child/id input))})
-          inputs)))
- 
-;; actual output of the resolver will be
-
-[{:pending-authorization/yenda.pathauth-test--child-parents [:parent/id :child/id]}]
-```
-
-
-### Pending authentication resolver
-
-These resolvers are generated by Pathauth for the special resolvers and will simply un-nest the output of a resolver if the required authorizations are resolved.
-
-The previous example will generate the following pending authentication resolver:
-
-```clojure
-{:input
- [{#:pending-authorization/yenda.pathauth-test--child-parents [:child/parent? :parent/id :child/id]}],
- :op-name pending-authorization/yenda.pathauth-test--child-parents,
- :output [:parent/id]}
-```
-
-Looking at the two previous example we can see how things work under the hood. Lets take the following query example:
-
-```clojure
-    @(p.a.eql/process (assoc env ::p.a.eql/parallel? true :parent-id 4)
-                      [{[:child/id 1] [:parent/id]}])
-```
-- the child-parents resolver will be called, in order to obtain both the `:parent/id` and `:child/id` attributes that are required by the authorization resolver for `:child/parent?`
-- to find the `:parent/id` of the parent of a child, we need `:child/parent?`, but `:child/parent?` is resolved by checking that the `:parent/id` matches the `:parent-id` in the env
-- the query isn't resolved directly by the `child-parents` resolver, as its regular outputs are now nested in a `pending-authorization...`, but this now means `:parent/id` and `:child/id` are now available as input for the authorization resolver
-
-```clojure
-;; child-parents will output:
-[{:pending-authorization/yenda.pathauth-test--child-parents {:parent/id 4 :child/id 1}}]
-;; the authorization resolver is then able to resolve the authorization attribute
-[{:pending-authorization/yenda.pathauth-test--child-parents {:parent/id 4 :child/id 1 :child/parent? true}}]
-```
-- the `pending-authorization-resolver` can now resolve the query
-```clojure
-[{[:child/id 1] {:parent/id 4}}]
-```
 
 ## Library development
 
