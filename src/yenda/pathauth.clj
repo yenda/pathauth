@@ -45,5 +45,5 @@
                                                           k)))
                                                  ast)
                          eql/ast->query)]
-    (log/info :authed-query (pr-str authed-query))
+    (log/debug :authed-query (pr-str authed-query))
     (eql/query->ast authed-query)))
