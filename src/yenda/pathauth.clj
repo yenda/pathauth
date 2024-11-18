@@ -4,24 +4,32 @@
    [edn-query-language.core :as eql]
    [taoensso.timbre :as log]))
 
+(def authorization ::authorization)
 (def auth ::auth)
+(def authz ::authz)
 (def restricted ::restricted)
 
-(defn auth-attributes [attributes schema]
+(defn auth-attributes [attributes]
   (let [k->attr (taoensso.encore/keys-by ::attr/qualified-key attributes)]
-    (->> attributes
-         ;; are we sure we even want to filter by schema here?
-         #_(filter #(= schema (::attr/schema %)))
-         (reduce
-          (fn [auth-attributes {::attr/keys [qualified-key identity? identities]
-                                ::keys [auth] :as attribute}]
-            (assoc auth-attributes qualified-key
-                   (if identity?
-                     auth
-                     (vec (mapcat (fn [entity-id]
-                                    (::auth (k->attr entity-id)))
-                                  identities)))))
-          {}))))
+    (reduce
+     (fn [auth-attributes {::attr/keys [qualified-key identity? identities]
+                           ::keys [auth] :as attribute}]
+       (assoc auth-attributes qualified-key
+              (if identity?
+                auth
+                (vec (mapcat (fn [entity-id]
+                               (::auth (k->attr entity-id)))
+                             identities)))))
+     {}
+     attributes)))
+
+(defn attr->authz [attributes]
+  (reduce (fn [acc attr]
+            (if-let [authz (get attr authz)]
+              (assoc acc (:com.fulcrologic.rad.attributes/qualified-key attr) authz)
+              acc))
+          {}
+          attributes))
 
 (defn children-auth-attributes [auth-attrs children]
   (reduce (fn [acc {:keys [dispatch-key]}]
