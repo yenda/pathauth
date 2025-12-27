@@ -1,7 +1,8 @@
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.11.1"}
-        com.wsscode/pathom3 {:git/url "https://github.com/wilkerlucio/pathom3.git"
-                             :sha "d84b2995b50f45d59c75ead9e2558b8fc58aa5b7"}}
+        metosin/malli {:mvn/version "0.13.0"}
+        ;; axiom is a local dep for ax/* keys
+        axiom/axiom {:local/root "../axiom"}}
  :aliases
  {:build {:deps {io.github.seancorfield/build-clj
                  {:git/tag "v0.8.2" :git/sha "0ffdb4c"}}
