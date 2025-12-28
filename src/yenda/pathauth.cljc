@@ -148,10 +148,30 @@
         rules))
 
 (defn- requires-per-item-check?
-  "Check if rules require per-item permission check (not just org-level).
+  "Determines if rules require individual permission checks per child entity.
 
-   Rules with :is, :member-of, :when, :self need per-item checks.
-   Rules with only :role and :same-org can be done at parent level."
+   This drives whether pg2 uses inherit-permission or item-permission:
+   - inherit-permission: Single parent check, all children inherit permission
+   - item-permission: Axiom computes permission for each child individually
+
+   Returns truthy when any permit rule contains:
+   - :is - User must own specific field (e.g., :issue/reporter)
+   - :member-of - User in entity's member list (e.g., :project/members)
+   - :when - Custom predicate on entity data
+   - :self - Entity is the user themselves
+   - :inherit-from - Permission derived from related entity
+
+   Example (inherits from parent - efficient):
+     [{:role :member :same-org true :ops #{:read}}]
+     => All org members can read all children
+
+   Example (per-item check required):
+     [{:is :issue/reporter :ops #{:read :write}}]
+     => Only reporter of each issue can access it
+
+   Performance impact in pg2:
+   - inherit: 1 permission check for parent, bulk fetch all children
+   - item: N permission checks, then fetch only authorized children"
   [rules op]
   (let [permit-rules (filter #(and (contains? (:ops %) op)
                                    (not (:forbid %)))
