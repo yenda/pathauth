@@ -206,6 +206,17 @@
 ;; Rule Analysis
 ;; =============================================================================
 
+(defn- extract-ops
+  "Extract ops from a rule's :ops value.
+   :ops can be either:
+   - A set: #{:read :write :delete}
+   - A map (per-op conditions): {:read {:when :org/setting}}"
+  [ops-value]
+  (cond
+    (set? ops-value) ops-value
+    (map? ops-value) (set (keys ops-value))
+    :else #{}))
+
 (defn- rules-for-op
   "Get rules that apply to a specific operation."
   [rules op]
@@ -377,7 +388,7 @@
             inherited (analysis/inherited-operations rules)
 
             ;; Collect all ops from rules
-            all-ops (into #{} (mapcat :ops) rules)
+            all-ops (into #{} (mapcat (comp extract-ops :ops)) rules)
 
             ;; Computed ops = all ops minus inherited
             computed (set/difference all-ops (set (keys inherited)))

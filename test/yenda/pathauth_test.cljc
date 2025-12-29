@@ -392,3 +392,141 @@
                        {::pa/inherit-permission :project/can-read-issues})]
       (is (some? explanation))
       (is (contains? explanation :errors)))))
+
+;; =============================================================================
+;; Inline Permission Tests
+;; =============================================================================
+
+(deftest derive-resolver-config-test
+  (testing "simple same-org rule"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access [{:role :member :same-org true :ops #{:read}}]
+                ax/organization [:group/organization]}
+          config (pa/derive-resolver-config attr)]
+      (is (some? config))
+      (is (vector? (pa/resolver-inputs config)))
+      (is (= [:group/can-read?] (pa/permission-outputs config)))
+      (is (= {} (pa/inherited-ops config)))
+      (is (= #{:read} (pa/computed-ops config)))
+      (is (true? (pa/virtual? config)))))
+
+  (testing "multiple ops"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access [{:role :org-admin :same-org true :ops #{:read :write :delete}}]
+                ax/organization [:group/organization]}
+          config (pa/derive-resolver-config attr)]
+      (is (= #{:group/can-read? :group/can-write? :group/can-delete?}
+             (set (pa/permission-outputs config))))
+      (is (= #{:read :write :delete} (pa/computed-ops config)))))
+
+  (testing "rule with :when on related entity"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access [{:role :teacher :same-org true
+                            :when :organization/teachers-see-all-groups
+                            :ops #{:read}}]
+                ax/organization [:group/organization :organization/id]}
+          config (pa/derive-resolver-config attr)]
+      ;; Should have nested input for organization's attrs
+      (is (vector? (pa/resolver-inputs config)))
+      ;; First element is the id-attr
+      (is (= :group/id (first (pa/resolver-inputs config))))))
+
+  (testing "inheritance rule"
+    (let [attr {::attr/qualified-key :comment/id
+                ax/access [{:inherit-from [:comment/ticket :ticket/id] :ops #{:read}}
+                           {:is :comment/author :ops #{:write}}]
+                ax/organization [:comment/ticket :ticket/organization]}
+          config (pa/derive-resolver-config attr)]
+      ;; read inherits from parent
+      (is (= {:read {:path [:comment/ticket]
+                     :parent-id-attr :ticket/id
+                     :permission-attr :ticket/can-read?}}
+             (pa/inherited-ops config)))
+      ;; write is computed (not inherited)
+      (is (= #{:write} (pa/computed-ops config)))))
+
+  (testing "no ax/access returns nil"
+    (let [attr {::attr/qualified-key :group/id}]
+      (is (nil? (pa/derive-resolver-config attr)))))
+
+  (testing "empty ax/access returns nil"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access []}]
+      (is (nil? (pa/derive-resolver-config attr)))))
+
+  (testing "attribute with pg2 table is not virtual"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access [{:role :member :same-org true :ops #{:read}}]
+                ax/organization [:group/organization]
+                :com.fulcrologic.rad.database-adapters.pg2/table "groups"}
+          config (pa/derive-resolver-config attr)]
+      (is (false? (pa/virtual? config))))))
+
+(deftest compute-permissions-test
+  (testing "computes permissions using axiom rules"
+    (let [user {:id #uuid "00000000-0000-0000-0000-000000000001"
+                :role :member
+                :organization #uuid "00000000-0000-0000-0000-000000000002"
+                :teams #{}}
+          entity {:group/id #uuid "00000000-0000-0000-0000-000000000003"
+                  :group/organization #uuid "00000000-0000-0000-0000-000000000002"}
+          rules [{:role :member :same-org true :ops #{:read}}]
+          org-path [:group/organization]
+          perms (pa/compute-permissions user entity rules org-path #{:read :write})]
+      (is (true? (:can-read? perms)))
+      (is (false? (:can-write? perms)))))
+
+  (testing "returns false for unauthorized user"
+    (let [user {:id #uuid "00000000-0000-0000-0000-000000000001"
+                :role :member
+                :organization #uuid "00000000-0000-0000-0000-000000000099"  ; Different org
+                :teams #{}}
+          entity {:group/id #uuid "00000000-0000-0000-0000-000000000003"
+                  :group/organization #uuid "00000000-0000-0000-0000-000000000002"}
+          rules [{:role :member :same-org true :ops #{:read}}]
+          org-path [:group/organization]
+          perms (pa/compute-permissions user entity rules org-path #{:read})]
+      (is (false? (:can-read? perms)))))
+
+  (testing "multiple rules - first matching wins"
+    (let [user {:id #uuid "00000000-0000-0000-0000-000000000001"
+                :role :org-admin
+                :organization #uuid "00000000-0000-0000-0000-000000000002"
+                :teams #{}}
+          entity {:group/id #uuid "00000000-0000-0000-0000-000000000003"
+                  :group/organization #uuid "00000000-0000-0000-0000-000000000002"}
+          rules [{:role :org-admin :same-org true :ops #{:read :write :delete}}
+                 {:role :member :same-org true :ops #{:read}}]
+          org-path [:group/organization]
+          perms (pa/compute-permissions user entity rules org-path #{:read :write :delete})]
+      (is (true? (:can-read? perms)))
+      (is (true? (:can-write? perms)))
+      (is (true? (:can-delete? perms))))))
+
+(deftest derive-inline-options-test
+  (testing "combines legacy and inline options"
+    (let [attr {::attr/qualified-key :group/id
+                ax/access [{:role :member :same-org true :ops #{:read :write}}]
+                ax/organization [:group/organization]}
+          result (pa/derive-inline-options attr)]
+      ;; Legacy keys
+      (is (= :group/can-read? (pa/entity-permission result)))
+      (is (= :group/can-write? (pa/write-permission result)))
+      ;; Inline keys
+      (is (vector? (pa/resolver-inputs result)))
+      (is (some? (pa/permission-outputs result)))
+      (is (some? (pa/computed-ops result))))))
+
+(deftest augment-attribute-inline-test
+  (testing "augment-attribute includes inline config for identity attributes"
+    (let [attr {::attr/qualified-key :group/id
+                ::attr/identity? true
+                ax/access [{:role :member :same-org true :ops #{:read}}]
+                ax/organization [:group/organization]}
+          result (pa/augment-attribute attr)]
+      ;; Legacy permission key
+      (is (= :group/can-read? (pa/entity-permission result)))
+      ;; New inline keys
+      (is (vector? (pa/resolver-inputs result)))
+      (is (= [:group/can-read?] (pa/permission-outputs result)))
+      (is (= #{:read} (pa/computed-ops result))))))
