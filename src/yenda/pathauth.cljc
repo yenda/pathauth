@@ -2,32 +2,47 @@
   "Pathauth bridges axiom's authorization rules (ax/*) to pg2's resolver generation.
 
    Transforms declarative access rules into resolver input requirements (pa/* options).
-   pg2 reads these options to generate gated resolvers.
+   pg2 reads these options to generate resolvers with inline permission computation.
 
    ## Architecture
 
    ```
    Axiom (ax/access rules)
        ↓
-   Pathauth (derives pa/* options)
+   Pathauth (derives pa/* options, provides compute-permissions)
        ↓
-   pg2 (reads pa/*, generates gated resolvers)
+   pg2 (reads pa/*, computes permissions inline in resolvers)
    ```
+
+   ## Inline Permissions (New Pattern)
+
+   Data resolvers are UNGATED and compute permissions inline using fetched data.
+   This eliminates the self-referential cycle where permission resolver needs
+   entity data, but data resolver is gated on permission.
+
+   pg2 reads pa/* options to determine:
+   - What additional Pathom inputs are needed (for :when conditions on related entities)
+   - What permission attrs to output (:entity/can-read?, etc.)
+   - Which ops inherit from parent vs need computation
 
    ## Usage
 
    ```clojure
    (defattr issue-id :issue/id :uuid
      {::attr/identity? true
-      ax/access [{:role :member :same-org true :ops #{:read}}]
-
-      ;; Pathauth options (derived or explicit)
-      pa/entity-permission :issue/can-read?})
+      ax/access [{:role :member :same-org true :ops #{:read}}]})
+      ;; pa/* options derived automatically by augment-attributes
    ```"
   (:require
    [com.fulcrologic.rad.attributes :as-alias attr]
    [axiom :as ax]
-   [malli.core :as m]))
+   [axiom.pathom.access :as axiom-access]
+   [axiom.pathom.analysis :as analysis]
+   [clojure.set :as set]
+   [malli.core :as m]
+   ;; Legacy API dependencies
+   [edn-query-language.core :as eql]
+   [taoensso.timbre :as log]))
 
 ;; =============================================================================
 ;; Keys (pa/*)
@@ -83,6 +98,62 @@
 
    Effect: Mutations check this before creating child entities."
   ::create-permission)
+
+;; =============================================================================
+;; New Keys for Inline Permission Computation
+;; =============================================================================
+
+(def resolver-inputs
+  "Additional Pathom inputs needed for permission rules.
+
+   Derived from ax/access rules analysis. pg2 adds these to ::pco/input.
+
+   Example: [{:group/organization [:organization/id
+                                   :organization/teachers-see-all-groups]}]"
+  ::resolver-inputs)
+
+(def permission-outputs
+  "Permission attrs to add to resolver output.
+
+   Example: [:group/can-read? :group/can-write? :group/can-delete?]"
+  ::permission-outputs)
+
+(def inherited-ops
+  "Operations that inherit permission from parent entity.
+
+   Map of op -> inheritance info. pg2 passes through parent permission
+   instead of computing it.
+
+   Example:
+   {:read {:path [:comment/ticket]
+           :parent-id-attr :ticket/id
+           :permission-attr :ticket/can-read?}}"
+  ::inherited-ops)
+
+(def computed-ops
+  "Operations that need permission computation.
+
+   Set of ops. pg2 calls compute-permissions for these.
+   (All ops minus inherited-ops)"
+  ::computed-ops)
+
+(def virtual?
+  "True if entity has no database table.
+
+   When true, entity uses axiom.pathom.resolvers instead of pg2."
+  ::virtual?)
+
+(def related-attrs
+  "Attrs from related entities needed for :when conditions.
+
+   Map of ref-attr -> set of attrs to fetch from related entity.
+   pg2 batch-fetches these after the main entity query.
+
+   Example:
+   {:group/organization #{:organization/id :organization/teachers-see-all-groups}}
+
+   Means: fetch organization's teachers-see-all-groups setting for permission rules."
+  ::related-attrs)
 
 ;; =============================================================================
 ;; Malli Schemas
@@ -235,18 +306,128 @@
         ;; Inherit: all children get parent's permission
         {inherit-permission (permission-attr source-key :read target-key)}))))
 
+;; =============================================================================
+;; Inline Permission Computation
+;; =============================================================================
+
+(defn compute-permissions
+  "Compute permissions for an entity. Called by pg2 inline.
+
+   Arguments:
+   - user: User map {:id :role :organization :teams}
+   - entity: Entity data with all required attrs for rule evaluation
+   - rules: ax/access rules
+   - org-path: ax/organization path
+   - ops: Set of ops to compute (excludes inherited)
+
+   Returns:
+   {:can-read? true/false
+    :can-write? true/false
+    :can-delete? true/false}
+
+   Example:
+   (compute-permissions
+     {:id user-1 :role :member :organization org-1 :teams #{}}
+     {:group/id group-1 :group/organization org-1}
+     [{:role :member :same-org true :ops #{:read}}]
+     [:group/organization]
+     #{:read :write :delete})
+   => {:can-read? true :can-write? false :can-delete? false}"
+  [user entity rules org-path ops]
+  (into {}
+        (map (fn [op]
+               [(keyword (str "can-" (name op) "?"))
+                (axiom-access/allowed? user entity op rules org-path)]))
+        ops))
+
+(defn derive-resolver-config
+  "Derive resolver configuration from attribute's axiom rules.
+
+   Analyzes ax/access and ax/organization to determine:
+   - What Pathom inputs are needed for permission computation
+   - What permission attrs to output
+   - Which ops inherit from parent vs need computation
+   - What related entity data needs batch-fetching
+
+   Arguments:
+   - attribute: Attribute map with ax/access, ax/organization
+
+   Returns pa/* options to merge into attribute:
+   {::resolver-inputs [...]
+    ::permission-outputs [...]
+    ::inherited-ops {...}
+    ::computed-ops #{...}
+    ::related-attrs {...}
+    ::virtual? false}
+
+   Returns nil if attribute has no ax/access rules."
+  [attribute]
+  (let [rules (get attribute ax/access)
+        org-path (get attribute ax/organization)
+        id-attr (::attr/qualified-key attribute)
+        entity-ns (namespace id-attr)]
+    (when (seq rules)
+      (let [;; Analyze inputs for related entity data
+            input-analysis (analysis/analyze-inputs id-attr rules org-path)
+
+            ;; Build Pathom input from analysis
+            pathom-input (analysis/build-pathom-input id-attr input-analysis)
+
+            ;; Get inherited operations
+            inherited (analysis/inherited-operations rules)
+
+            ;; Collect all ops from rules
+            all-ops (into #{} (mapcat :ops) rules)
+
+            ;; Computed ops = all ops minus inherited
+            computed (set/difference all-ops (set (keys inherited)))
+
+            ;; Build permission output attrs for all ops
+            perm-outputs (mapv #(keyword entity-ns (str "can-" (name %) "?"))
+                               all-ops)
+
+            ;; Related attrs that need batch-fetching (from analysis)
+            related (:related-attrs input-analysis)
+
+            ;; Check if virtual (no database table)
+            ;; This uses rad.pg2/table which may not be present
+            is-virtual? (nil? (get attribute :com.fulcrologic.rad.database-adapters.pg2/table))]
+
+        (cond-> {::resolver-inputs pathom-input
+                 ::permission-outputs perm-outputs
+                 ::inherited-ops inherited
+                 ::computed-ops computed
+                 ::virtual? is-virtual?}
+          (seq related) (assoc ::related-attrs related))))))
+
+(defn derive-inline-options
+  "Derive inline permission options for an identity attribute.
+
+   Combines legacy derive-options (for backwards compatibility)
+   with new derive-resolver-config (for inline permissions).
+
+   Returns merged pa/* options."
+  [attribute]
+  (let [legacy (derive-options attribute)
+        inline (derive-resolver-config attribute)]
+    (merge legacy inline)))
+
+;; =============================================================================
+;; Augmentation Functions
+;; =============================================================================
+
 (defn augment-attribute
   "Add pa/* options to a single attribute based on ax/* rules.
 
-   For identity attributes: derives entity permissions
+   For identity attributes: derives entity permissions AND inline permission config
    For ref attributes: derives relationship permissions (needs target lookup)"
   ([attribute]
    (augment-attribute attribute nil))
   ([attribute target-attribute]
    (cond
-     ;; Identity attribute - derive entity permissions
+     ;; Identity attribute - derive entity permissions + inline config
      (::attr/identity? attribute)
-     (merge attribute (derive-options attribute))
+     (merge attribute (derive-inline-options attribute))
 
      ;; Ref attribute with target - derive relationship permissions
      (and (::attr/target attribute) target-attribute)
@@ -322,3 +503,93 @@
   "Explain validation errors for relationship options."
   [options]
   (m/explain RelationshipPermissionOptions options))
+
+;; =============================================================================
+;; Legacy API (Backwards Compatibility)
+;; =============================================================================
+;; The following provides backwards compatibility with the query-based
+;; authorization system. New code should use ax/access rules with
+;; augment-attributes instead.
+
+(def auth
+  "LEGACY: Query-based authorization attribute.
+
+   Specifies authorization attributes that must be queried and checked.
+   New code should use ax/access rules which are automatically converted
+   to permission attributes via augment-attributes.
+
+   Example (legacy):
+     (defattr id :subject/id :uuid
+       {pa/auth [:course/authorized?]})
+
+   Example (new approach):
+     (defattr id :group/id :uuid
+       {ax/access [{:role :member :same-org true :ops #{:read}}]})"
+  ::auth)
+
+(def authorization
+  "LEGACY: Authorization key for pathom env."
+  ::authorization)
+
+(def authz
+  "LEGACY: Per-attribute authorization checks."
+  ::authz)
+
+(def restricted
+  "LEGACY: Restricted attributes flag."
+  ::restricted)
+
+(def bypass?
+  "Flag to bypass authorization checks.
+
+   Set in env to skip permission checking (e.g., for system operations)."
+  ::bypass?)
+
+(defn auth-attributes
+  "LEGACY: Build a map of qualified-key to auth requirements.
+
+   Used by the old query-based authorization system."
+  [attributes]
+  (let [k->attr (into {} (map (juxt ::attr/qualified-key identity)) attributes)]
+    (reduce
+     (fn [auth-attrs {::attr/keys [qualified-key identity? identities]
+                      ::keys [auth] :as _attribute}]
+       (assoc auth-attrs qualified-key
+              (if identity?
+                auth
+                (vec (mapcat (fn [entity-id]
+                               (::auth (k->attr entity-id)))
+                             identities)))))
+     {}
+     attributes)))
+
+(defn- children-auth-attributes
+  "LEGACY: Get auth attributes for children of an AST node."
+  [auth-attrs children]
+  (reduce (fn [acc {:keys [dispatch-key]}]
+            (into acc (get auth-attrs dispatch-key)))
+          #{}
+          children))
+
+(defn auth-query
+  "LEGACY: Add authorization attributes to query.
+
+   Transforms an EQL query to include authorization checks
+   based on the auth-attrs mapping."
+  [auth-attrs query]
+  (let [ast (eql/query->ast query)
+        authed-query
+        (-> (eql/transduce-children
+             (map (fn [{:keys [children] :as ast-node}]
+                    (reduce (fn [acc authorization]
+                              (update acc
+                                      :children conj
+                                      {:type :prop
+                                       :dispatch-key authorization
+                                       :key authorization}))
+                            ast-node
+                            (children-auth-attributes auth-attrs children))))
+             ast)
+            eql/ast->query)]
+    (log/debug :authed-query (pr-str authed-query))
+    (eql/query->ast authed-query)))
