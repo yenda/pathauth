@@ -36,8 +36,6 @@
   (:require
    [com.fulcrologic.rad.attributes :as-alias attr]
    [axiom :as ax]
-   [axiom.pathom.access :as axiom-access]
-   [axiom.pathom.analysis :as analysis]
    [clojure.set :as set]
    [malli.core :as m]
    ;; Legacy API dependencies
@@ -344,11 +342,13 @@
      [:group/organization]
      #{:read :write :delete})
    => {:can-read? true :can-write? false :can-delete? false}"
-  [user entity rules org-path ops]
+  [_user _entity _rules _org-path ops]
+  ;; TODO: Implement when axiom.pathom.access is available
+  ;; For now, return false for all ops (deny by default)
+  (log/warn "compute-permissions not implemented - denying all access")
   (into {}
         (map (fn [op]
-               [(keyword (str "can-" (name op) "?"))
-                (axiom-access/allowed? user entity op rules org-path)]))
+               [(keyword (str "can-" (name op) "?")) false]))
         ops))
 
 (defn derive-resolver-config
@@ -374,42 +374,26 @@
    Returns nil if attribute has no ax/access rules."
   [attribute]
   (let [rules (get attribute ax/access)
-        org-path (get attribute ax/organization)
         id-attr (::attr/qualified-key attribute)
         entity-ns (namespace id-attr)]
     (when (seq rules)
-      (let [;; Analyze inputs for related entity data
-            input-analysis (analysis/analyze-inputs id-attr rules org-path)
-
-            ;; Build Pathom input from analysis
-            pathom-input (analysis/build-pathom-input id-attr input-analysis)
-
-            ;; Get inherited operations
-            inherited (analysis/inherited-operations rules)
-
-            ;; Collect all ops from rules
+      ;; TODO: Full analysis requires axiom.pathom.analysis which is not yet implemented
+      ;; For now, return minimal config with just permission outputs
+      (let [;; Collect all ops from rules
             all-ops (into #{} (mapcat (comp extract-ops :ops)) rules)
-
-            ;; Computed ops = all ops minus inherited
-            computed (set/difference all-ops (set (keys inherited)))
 
             ;; Build permission output attrs for all ops
             perm-outputs (mapv #(keyword entity-ns (str "can-" (name %) "?"))
                                all-ops)
 
-            ;; Related attrs that need batch-fetching (from analysis)
-            related (:related-attrs input-analysis)
-
             ;; Check if virtual (no database table)
-            ;; This uses rad.pg2/table which may not be present
             is-virtual? (nil? (get attribute :com.fulcrologic.rad.database-adapters.pg2/table))]
 
-        (cond-> {::resolver-inputs pathom-input
-                 ::permission-outputs perm-outputs
-                 ::inherited-ops inherited
-                 ::computed-ops computed
-                 ::virtual? is-virtual?}
-          (seq related) (assoc ::related-attrs related))))))
+        {::resolver-inputs []
+         ::permission-outputs perm-outputs
+         ::inherited-ops {}
+         ::computed-ops all-ops
+         ::virtual? is-virtual?}))))
 
 (defn derive-inline-options
   "Derive inline permission options for an identity attribute.
